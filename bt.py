@@ -547,10 +547,11 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
         for sym, df in aligned.items():
             next_row = df.iloc[i + 1]
             next_open = next_row["open"]
-            next_high = next_row["high"]
-            next_low = next_row["low"]
             if positions[sym] is not None:
                 pos = positions[sym]
+                if "exit_idx" not in pos:
+                    raise RuntimeError(f"{sym}: open position has no precomputed trade simulation")
+
                 if "exit_idx" in pos:
                     if pos["exit_idx"] <= i + 1:
                         close = _close_position_record(sym, pos, next_ts, fold_id)
