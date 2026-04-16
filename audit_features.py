@@ -45,8 +45,9 @@ NEW_FEATURES = [
 
 CORE_FEATURES = [
     "hurst_rs",
-    "EMA_50",
-    "EMA_200",
+    "ema50_dist",
+    "ema200_dist",
+    "ema_spread_50_200",
     "channel_width_50",
     "Dist_to_Resistance",
     "ret_24",

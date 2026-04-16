@@ -29,8 +29,9 @@ HURST_WINDOW = 100
 
 # Мультисимвольный baseline: ядро + несколько условно полезных фич
 FEATURE_COLUMNS = (
-    "EMA_50",
-    "EMA_200",
+    "ema50_dist",
+    "ema200_dist",
+    "ema_spread_50_200",
     "Dist_to_Resistance",
     "vol_ratio_12_24",
     "vol_24",
@@ -44,7 +45,7 @@ FEATURE_COLUMNS = (
     "atr_pct",
 )
 
-FEATURE_SET_VERSION = 101
+FEATURE_SET_VERSION = 102
 
 # --- TARGET / LABEL SIMULATION ---
 HORIZON = 12

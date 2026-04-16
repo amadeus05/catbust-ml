@@ -187,6 +187,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
+    df["ema50_dist"] = df["close"] / df["EMA_50"].replace(0, 1e-9) - 1.0
+    df["ema200_dist"] = df["close"] / df["EMA_200"].replace(0, 1e-9) - 1.0
+    df["ema_spread_50_200"] = df["EMA_50"] / df["EMA_200"].replace(0, 1e-9) - 1.0
 
     df["vol_24"] = ret_1.rolling(24).std()
     vol_12 = ret_1.rolling(12).std()
