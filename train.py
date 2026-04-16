@@ -258,6 +258,30 @@ def train_single_regressor(X_train, y_train, X_test, y_test, verbose=False):
     return model, preds, metrics, np.asarray(importances, dtype=float)
 
 
+def split_inner_train_validation(df_train: pd.DataFrame, val_frac=0.15):
+    df_train = df_train.sort_values("timestamp").reset_index(drop=True)
+    timestamps = sorted(df_train["timestamp"].drop_duplicates().tolist())
+
+    if len(timestamps) < 3:
+        cut_row = max(1, int(len(df_train) * (1.0 - val_frac)))
+        return df_train.iloc[:cut_row].copy(), df_train.iloc[cut_row:].copy()
+
+    val_ts_count = max(1, int(round(len(timestamps) * val_frac)))
+    if len(timestamps) - val_ts_count < 1:
+        val_ts_count = 1
+
+    first_val_ts = timestamps[-val_ts_count]
+    fit = df_train[df_train["timestamp"] < first_val_ts].copy().reset_index(drop=True)
+    val = df_train[df_train["timestamp"] >= first_val_ts].copy().reset_index(drop=True)
+
+    if len(fit) == 0 or len(val) == 0:
+        cut_row = max(1, int(len(df_train) * (1.0 - val_frac)))
+        fit = df_train.iloc[:cut_row].copy()
+        val = df_train.iloc[cut_row:].copy()
+
+    return fit, val
+
+
 def _fmt(x, nd=4):
     try:
         if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
@@ -269,7 +293,7 @@ def _fmt(x, nd=4):
 
 def print_fold_header(fold_id, train_start_ts, train_cutoff, first_test_ts, last_test_ts, n_train, n_test):
     print(f"\n--- Фолд {fold_id} | train: {train_start_ts} … {train_cutoff} | rows={n_train} ---")
-    print(f"    OOS/val:      {first_test_ts} … {last_test_ts} | rows={n_test}")
+    print(f"    OOS:          {first_test_ts} … {last_test_ts} | rows={n_test}")
 
 
 def print_fold_metrics_block(long_metrics, short_metrics, long_thr_info, short_thr_info):
@@ -304,7 +328,7 @@ def print_fold_summary_table(df_folds):
         return
 
     print("\n" + "=" * 132)
-    print("СВОДКА WALK-FORWARD TRAIN/VAL ПО ФОЛДАМ")
+    print("СВОДКА WALK-FORWARD OOS ПО ФОЛДАМ")
     print("=" * 132)
 
     line = (
@@ -492,7 +516,7 @@ def train():
     print(f"Фичей:           {len(FEATURE_COLUMNS)}")
     print(f"Символов:        {df_full['symbol'].nunique()}")
     print(f"Фолдов:          {len(folds)}")
-    print(f"Train≈{WF_TRAIN_DAYS}d | OOS/val≈{WF_TEST_DAYS}d | step≈{WF_STEP_DAYS}d")
+    print(f"Train≈{WF_TRAIN_DAYS}d | OOS≈{WF_TEST_DAYS}d | step≈{WF_STEP_DAYS}d")
 
     features = list(FEATURE_COLUMNS)
 
@@ -529,27 +553,46 @@ def train():
             fid, train_start_ts, train_cutoff, first_test_ts, last_test_ts, len(df_train), len(df_test)
         )
 
-        X_train = df_train[features]
+        df_fit, df_val = split_inner_train_validation(df_train)
+        if len(df_fit) < 1000 or len(df_val) < 100:
+            print(
+                f"\n⚠️ Фолд {fid}: inner fit={len(df_fit)}, inner val={len(df_val)} — пропуск"
+            )
+            continue
+
+        X_fit = df_fit[features]
+        X_val = df_val[features]
         X_test = df_test[features]
 
-        y_long_train = df_train["Target_Long_Return"]
+        y_long_fit = df_fit["Target_Long_Return"]
+        y_long_val = df_val["Target_Long_Return"]
         y_long_test = df_test["Target_Long_Return"]
-        y_short_train = df_train["Target_Short_Return"]
+        y_short_fit = df_fit["Target_Short_Return"]
+        y_short_val = df_val["Target_Short_Return"]
         y_short_test = df_test["Target_Short_Return"]
 
         try:
-            long_model, long_preds, long_metrics, long_imp = train_single_regressor(
-                X_train, y_long_train, X_test, y_long_test, verbose=False
+            long_model, long_val_preds, long_val_metrics, long_imp = train_single_regressor(
+                X_fit, y_long_fit, X_val, y_long_val, verbose=False
             )
-            short_model, short_preds, short_metrics, short_imp = train_single_regressor(
-                X_train, y_short_train, X_test, y_short_test, verbose=False
+            short_model, short_val_preds, short_val_metrics, short_imp = train_single_regressor(
+                X_fit, y_short_fit, X_val, y_short_val, verbose=False
             )
         except Exception as e:
             print(f"❌ Фолд {fid}: ошибка обучения: {e}")
             continue
 
-        long_thr_info = calibrate_side_threshold(y_long_test.to_numpy(), long_preds, side_name="LONG")
-        short_thr_info = calibrate_side_threshold(y_short_test.to_numpy(), short_preds, side_name="SHORT")
+        long_preds = long_model.predict(X_test)
+        short_preds = short_model.predict(X_test)
+        long_metrics = evaluate_regression(y_true=y_long_test, y_pred=long_preds, top_frac=0.10)
+        short_metrics = evaluate_regression(y_true=y_short_test, y_pred=short_preds, top_frac=0.10)
+
+        long_thr_info = calibrate_side_threshold(
+            y_long_val.to_numpy(), long_val_preds, side_name="LONG"
+        )
+        short_thr_info = calibrate_side_threshold(
+            y_short_val.to_numpy(), short_val_preds, side_name="SHORT"
+        )
 
         print_fold_metrics_block(long_metrics, short_metrics, long_thr_info, short_thr_info)
 
@@ -557,6 +600,8 @@ def train():
             {
                 "fold_id": fid,
                 "train_n": len(df_train),
+                "inner_fit_n": len(df_fit),
+                "inner_val_n": len(df_val),
                 "test_n": len(df_test),
                 "train_start_ts": train_start_ts,
                 "train_end_ts": train_cutoff,
@@ -570,6 +615,10 @@ def train():
                 "short_top_mean": short_metrics["mean_true_top_pred"],
                 "short_pred_pos_count": short_metrics["pred_pos_count"],
                 "short_mean_true_pred_pos": short_metrics["mean_true_pred_pos"],
+                "long_val_spearman": long_val_metrics["spearman"],
+                "long_val_top_mean": long_val_metrics["mean_true_top_pred"],
+                "short_val_spearman": short_val_metrics["spearman"],
+                "short_val_top_mean": short_val_metrics["mean_true_top_pred"],
                 "long_threshold": long_thr_info["threshold"],
                 "short_threshold": short_thr_info["threshold"],
                 "long_calib_top_frac": long_thr_info["top_frac"],
@@ -586,10 +635,10 @@ def train():
         long_imps.append(long_imp)
         short_imps.append(short_imp)
 
-        long_sp = np.nan_to_num(long_metrics["spearman"], nan=-1.0)
-        short_sp = np.nan_to_num(short_metrics["spearman"], nan=-1.0)
-        long_top = np.nan_to_num(long_metrics["mean_true_top_pred"], nan=-0.005)
-        short_top = np.nan_to_num(short_metrics["mean_true_top_pred"], nan=-0.005)
+        long_sp = np.nan_to_num(long_val_metrics["spearman"], nan=-1.0)
+        short_sp = np.nan_to_num(short_val_metrics["spearman"], nan=-1.0)
+        long_top = np.nan_to_num(long_val_metrics["mean_true_top_pred"], nan=-0.005)
+        short_top = np.nan_to_num(short_val_metrics["mean_true_top_pred"], nan=-0.005)
 
         long_top = np.clip(long_top, -0.01, 0.01)
         short_top = np.clip(short_top, -0.01, 0.01)
