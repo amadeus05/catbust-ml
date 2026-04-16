@@ -45,12 +45,15 @@ FEATURE_COLUMNS = (
     "atr_pct",
 )
 
-FEATURE_SET_VERSION = 102
+FEATURE_SET_VERSION = 103
 
 # --- TARGET / LABEL SIMULATION ---
 HORIZON = 12
+TARGET_MODE = "atr"  # "pct" | "atr"
 TP_PCT = 0.030
 SL_PCT = 0.015
+TP_ATR_MULT = 2.0
+SL_ATR_MULT = 1.0
 
 # Издержки, встроенные в таргет
 TAKER_COM = 0.0004

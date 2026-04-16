@@ -54,7 +54,7 @@ def load_all_data(symbols, feature_names):
 
                 cols_to_keep = [
                     "timestamp", "open", "high", "low", "close",
-                    "Target_Long_Return", "Target_Short_Return"
+                    "Target_Long_Return", "Target_Short_Return", "atr_14"
                 ] + list(feature_names)
 
                 missing_cols = [c for c in cols_to_keep if c not in df.columns]
@@ -412,7 +412,7 @@ def build_continuous_oos_context(trained_packs, all_dfs_bt, common_timestamps):
     для OOS-симуляции нам НЕ нужны target-колонки,
     поэтому dropna делаем только по OHLC + feature columns.
     """
-    required_oos_cols = ["open", "high", "low", "close"] + list(FEATURE_COLUMNS)
+    required_oos_cols = ["open", "high", "low", "close", "atr_14"] + list(FEATURE_COLUMNS)
 
     all_aligned = align_dataframes_to_common_index(
         all_dfs_bt,
@@ -705,7 +705,15 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
 
                 if signal != 0:
                     risk_capital = balance * RISK_PER_TRADE
-                    position_notional = risk_capital / SL_PCT
+                    if TARGET_MODE == "atr":
+                        stop_risk_pct = float(current_row["atr_14"]) * SL_ATR_MULT / max(float(next_open), 1e-9)
+                    else:
+                        stop_risk_pct = SL_PCT
+
+                    if not np.isfinite(stop_risk_pct) or stop_risk_pct <= 0:
+                        continue
+
+                    position_notional = risk_capital / stop_risk_pct
                     position_notional = min(position_notional, balance * LEVERAGE)
 
                     required_margin = position_notional / LEVERAGE
@@ -738,6 +746,10 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
                         sl_pct=SL_PCT,
                         slippage=SLIPPAGE,
                         taker_com=TAKER_COM,
+                        target_mode=TARGET_MODE,
+                        entry_atr=float(current_row["atr_14"]),
+                        tp_atr_mult=TP_ATR_MULT,
+                        sl_atr_mult=SL_ATR_MULT,
                     )
 
                     positions[sym] = {

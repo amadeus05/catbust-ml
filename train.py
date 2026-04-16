@@ -27,6 +27,8 @@ def load_data_from_db():
         df["symbol"] = raw_name.replace("_", "/", 1) if "_" in raw_name else raw_name
 
         needed_cols = ["Target_Long_Return", "Target_Short_Return"]
+        if TARGET_MODE == "atr":
+            needed_cols.append("atr_14")
         if not all(col in df.columns for col in needed_cols):
             print(f"⚠️ Пропуск {table}: нет колонок {needed_cols}")
             continue
@@ -39,7 +41,7 @@ def load_data_from_db():
             )
 
         df = df.dropna(
-            subset=["timestamp", *FEATURE_COLUMNS, "Target_Long_Return", "Target_Short_Return"]
+            subset=["timestamp", *FEATURE_COLUMNS, *needed_cols]
         ).copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         start_ts = pd.to_datetime(START_DATE)

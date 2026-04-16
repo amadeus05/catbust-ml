@@ -218,6 +218,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     atr_14 = df.ta.atr(length=14).replace(0, 1e-9)
     atr_28 = df.ta.atr(length=28).replace(0, 1e-9)
+    df["atr_14"] = atr_14
     df["atr_pct"] = atr_14 / close_safe
     df["atr_expansion_14_28"] = atr_14 / atr_28
 
@@ -255,6 +256,7 @@ def add_trade_return_targets(df: pd.DataFrame) -> pd.DataFrame:
     highs = df["high"].to_numpy(dtype=np.float64)
     lows = df["low"].to_numpy(dtype=np.float64)
     closes = df["close"].to_numpy(dtype=np.float64)
+    atrs = df["atr_14"].to_numpy(dtype=np.float64)
 
     logger.info(f"▶️ Начинаю расчет trade-return таргетов: rows={n}, usable={usable}")
 
@@ -278,6 +280,10 @@ def add_trade_return_targets(df: pd.DataFrame) -> pd.DataFrame:
             sl_pct=SL_PCT,
             slippage=SLIPPAGE,
             taker_com=TAKER_COM,
+            target_mode=TARGET_MODE,
+            entry_atr=atrs[i],
+            tp_atr_mult=TP_ATR_MULT,
+            sl_atr_mult=SL_ATR_MULT,
         ).return_pct
         short_targets[i] = simulate_trade_return(
             direction=-1,
@@ -290,6 +296,10 @@ def add_trade_return_targets(df: pd.DataFrame) -> pd.DataFrame:
             sl_pct=SL_PCT,
             slippage=SLIPPAGE,
             taker_com=TAKER_COM,
+            target_mode=TARGET_MODE,
+            entry_atr=atrs[i],
+            tp_atr_mult=TP_ATR_MULT,
+            sl_atr_mult=SL_ATR_MULT,
         ).return_pct
 
         if i % 5000 == 0 and i > 0:

@@ -24,6 +24,10 @@ def simulate_trade_return(
     sl_pct: float,
     slippage: float,
     taker_com: float,
+    target_mode: str = "pct",
+    entry_atr: float | None = None,
+    tp_atr_mult: float | None = None,
+    sl_atr_mult: float | None = None,
 ) -> TradeSimulationResult:
     """
     Simulate one fixed-rule trade from the entry bar through the supplied window.
@@ -49,8 +53,27 @@ def simulate_trade_return(
 
     if direction == 1:
         entry_price = float(entry_open) * (1.0 + slippage)
-        tp_price = entry_price * (1.0 + tp_pct)
-        sl_price = entry_price * (1.0 - sl_pct)
+    else:
+        entry_price = float(entry_open) * (1.0 - slippage)
+
+    target_mode = str(target_mode).lower()
+    if target_mode == "pct":
+        tp_distance = entry_price * float(tp_pct)
+        sl_distance = entry_price * float(sl_pct)
+    elif target_mode == "atr":
+        if entry_atr is None or tp_atr_mult is None or sl_atr_mult is None:
+            raise ValueError("entry_atr, tp_atr_mult, and sl_atr_mult are required for atr mode")
+        if not np.isfinite(entry_atr) or entry_atr <= 0:
+            raise ValueError("entry_atr must be a positive finite value")
+
+        tp_distance = float(entry_atr) * float(tp_atr_mult)
+        sl_distance = float(entry_atr) * float(sl_atr_mult)
+    else:
+        raise ValueError("target_mode must be 'pct' or 'atr'")
+
+    if direction == 1:
+        tp_price = entry_price + tp_distance
+        sl_price = entry_price - sl_distance
 
         for k in range(len(opens)):
             bar_open = opens[k]
@@ -92,9 +115,8 @@ def simulate_trade_return(
             reason="TIMEOUT",
         )
 
-    entry_price = float(entry_open) * (1.0 - slippage)
-    tp_price = entry_price * (1.0 - tp_pct)
-    sl_price = entry_price * (1.0 + sl_pct)
+    tp_price = entry_price - tp_distance
+    sl_price = entry_price + sl_distance
 
     for k in range(len(opens)):
         bar_open = opens[k]
