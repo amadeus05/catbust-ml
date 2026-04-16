@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from config import *
+from trade_sim import simulate_trade_return
 
 from train import (
     load_data_from_db,
@@ -115,6 +116,25 @@ def calculate_unrealized_pnl(pos, mark_price):
         raw_pnl = (entry_price - mark_price) / entry_price
 
     return position_notional * raw_pnl
+
+
+def _close_position_record(sym, pos, exit_ts, fold_id):
+    pnl_clean = float(pos["sim_return"])
+    trade_profit = float(pos["size"]) * pnl_clean
+    return {
+        "trade": {
+            "sym": sym,
+            "dir": pos["dir"],
+            "pnl_pct": pnl_clean,
+            "pnl_abs": trade_profit,
+            "ts": exit_ts,
+            "fold_id": fold_id,
+        },
+        "pnl_clean": pnl_clean,
+        "trade_profit": trade_profit,
+        "commission": float(pos["size"]) * (TAKER_COM + TAKER_COM),
+        "reason": pos["exit_reason"],
+    }
 
 
 def build_walk_forward_folds(common_timestamps, purge_gap: pd.Timedelta):
@@ -529,9 +549,40 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
             next_open = next_row["open"]
             next_high = next_row["high"]
             next_low = next_row["low"]
-
             if positions[sym] is not None:
                 pos = positions[sym]
+                if "exit_idx" in pos:
+                    if pos["exit_idx"] <= i + 1:
+                        close = _close_position_record(sym, pos, next_ts, fold_id)
+
+                        used_margin -= pos["margin"]
+                        if used_margin < 0:
+                            used_margin = 0.0
+
+                        balance += close["trade_profit"]
+                        trades.append(close["trade"])
+
+                        fold_stats[fold_id]["trades"] += 1
+                        if close["pnl_clean"] > 0:
+                            fold_stats[fold_id]["wins"] += 1
+                        else:
+                            fold_stats[fold_id]["losses"] += 1
+
+                        if pos["dir"] == 1:
+                            fold_stats[fold_id]["longs"] += 1
+                        else:
+                            fold_stats[fold_id]["shorts"] += 1
+
+                        positions[sym] = None
+
+                        if verbose_trades:
+                            print(
+                                f"[{next_ts}] {sym}: {close['reason']} | "
+                                f"PnL: {close['pnl_clean']*100:.2f}% | "
+                                f"Com: {close['commission']:.2f}$ | Bal: {balance:.2f}"
+                            )
+                    continue
+
                 entry_price = pos["entry"]
                 direction = pos["dir"]
                 position_notional = pos["size"]
@@ -666,15 +717,32 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
                     used_margin += required_margin
 
                     if signal == 1:
-                        entry_price = next_open * (1 + SLIPPAGE)
                         chosen_pred = pred_long
                     else:
-                        entry_price = next_open * (1 - SLIPPAGE)
                         chosen_pred = pred_short
+
+                    entry_idx = i + 1
+                    horizon_end_idx = min(entry_idx + HORIZON, len(df))
+                    sim = simulate_trade_return(
+                        direction=signal,
+                        entry_open=next_open,
+                        opens=df["open"].iloc[entry_idx:horizon_end_idx].to_numpy(dtype=np.float64),
+                        highs=df["high"].iloc[entry_idx:horizon_end_idx].to_numpy(dtype=np.float64),
+                        lows=df["low"].iloc[entry_idx:horizon_end_idx].to_numpy(dtype=np.float64),
+                        closes=df["close"].iloc[entry_idx:horizon_end_idx].to_numpy(dtype=np.float64),
+                        tp_pct=TP_PCT,
+                        sl_pct=SL_PCT,
+                        slippage=SLIPPAGE,
+                        taker_com=TAKER_COM,
+                    )
 
                     positions[sym] = {
                         "dir": signal,
-                        "entry": entry_price,
+                        "entry": sim.entry_price,
+                        "exit_idx": entry_idx + sim.exit_bar_offset,
+                        "exit_price": sim.exit_price,
+                        "exit_reason": sim.reason,
+                        "sim_return": sim.return_pct,
                         "size": position_notional,
                         "margin": required_margin,
                         "ts_open": next_ts,
@@ -690,8 +758,38 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
                             f"[{next_ts}] {sym}: 🚀 OPEN {dir_str} "
                             f"(Pred L: {pred_long*100:.4f}%, Pred S: {pred_short*100:.4f}%, "
                             f"Thr L: {long_thr*100 if np.isfinite(long_thr) else float('nan'):.4f}%, Thr S: {short_thr*100 if np.isfinite(short_thr) else float('nan'):.4f}%) "
-                            f"at {entry_price:.2f} | Size: {position_notional:.1f}$"
+                            f"at {sim.entry_price:.2f} | Size: {position_notional:.1f}$"
                         )
+
+                    if sim.exit_bar_offset == 0:
+                        close = _close_position_record(sym, positions[sym], next_ts, fold_id)
+
+                        used_margin -= positions[sym]["margin"]
+                        if used_margin < 0:
+                            used_margin = 0.0
+
+                        balance += close["trade_profit"]
+                        trades.append(close["trade"])
+
+                        fold_stats[fold_id]["trades"] += 1
+                        if close["pnl_clean"] > 0:
+                            fold_stats[fold_id]["wins"] += 1
+                        else:
+                            fold_stats[fold_id]["losses"] += 1
+
+                        if signal == 1:
+                            fold_stats[fold_id]["longs"] += 1
+                        else:
+                            fold_stats[fold_id]["shorts"] += 1
+
+                        positions[sym] = None
+
+                        if verbose_trades:
+                            print(
+                                f"[{next_ts}] {sym}: {close['reason']} | "
+                                f"PnL: {close['pnl_clean']*100:.2f}% | "
+                                f"Com: {close['commission']:.2f}$ | Bal: {balance:.2f}"
+                            )
 
     if len(test_timestamps) > 0:
         last_ts = test_timestamps[-1]
@@ -699,6 +797,36 @@ def run_oos_simulation_continuous(trained_packs, all_dfs_bt, feature_names, comm
 
         for sym, pos in list(positions.items()):
             if pos is None:
+                continue
+
+            if "exit_idx" in pos:
+                close = _close_position_record(sym, pos, last_ts, last_fold_id)
+
+                used_margin -= pos["margin"]
+                if used_margin < 0:
+                    used_margin = 0.0
+
+                balance += close["trade_profit"]
+                trades.append(close["trade"])
+
+                fold_stats[last_fold_id]["trades"] += 1
+                if close["pnl_clean"] > 0:
+                    fold_stats[last_fold_id]["wins"] += 1
+                else:
+                    fold_stats[last_fold_id]["losses"] += 1
+
+                if pos["dir"] == 1:
+                    fold_stats[last_fold_id]["longs"] += 1
+                else:
+                    fold_stats[last_fold_id]["shorts"] += 1
+
+                positions[sym] = None
+
+                if verbose_trades:
+                    print(
+                        f"[{last_ts}] {sym}: {close['reason']} | "
+                        f"PnL: {close['pnl_clean']*100:.2f}% | Bal: {balance:.2f}"
+                    )
                 continue
 
             last_close = aligned[sym].iloc[-1]["close"]

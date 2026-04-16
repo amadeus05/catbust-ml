@@ -9,6 +9,7 @@ import pandas_ta as ta
 import requests
 
 from config import *
+from trade_sim import simulate_trade_return
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -218,70 +219,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _calc_long_trade_return_np(entry_price, opens, highs, lows, closes):
-    tp_price = entry_price * (1 + TP_PCT)
-    sl_price = entry_price * (1 - SL_PCT)
-
-    for k in range(len(opens)):
-        bar_open = opens[k]
-        bar_high = highs[k]
-        bar_low = lows[k]
-
-        hit_sl = bar_low <= sl_price
-        hit_tp = bar_high >= tp_price
-
-        if hit_sl and hit_tp:
-            exit_price = (bar_open if bar_open < sl_price else sl_price) * (1 - SLIPPAGE)
-            raw_ret = (exit_price - entry_price) / entry_price
-            return raw_ret - 2 * TAKER_COM
-
-        if hit_sl:
-            exit_price = (bar_open if bar_open < sl_price else sl_price) * (1 - SLIPPAGE)
-            raw_ret = (exit_price - entry_price) / entry_price
-            return raw_ret - 2 * TAKER_COM
-
-        if hit_tp:
-            exit_price = tp_price * (1 - SLIPPAGE)
-            raw_ret = (exit_price - entry_price) / entry_price
-            return raw_ret - 2 * TAKER_COM
-
-    exit_price = closes[-1] * (1 - SLIPPAGE)
-    raw_ret = (exit_price - entry_price) / entry_price
-    return raw_ret - 2 * TAKER_COM
-
-
-def _calc_short_trade_return_np(entry_price, opens, highs, lows, closes):
-    tp_price = entry_price * (1 - TP_PCT)
-    sl_price = entry_price * (1 + SL_PCT)
-
-    for k in range(len(opens)):
-        bar_open = opens[k]
-        bar_high = highs[k]
-        bar_low = lows[k]
-
-        hit_sl = bar_high >= sl_price
-        hit_tp = bar_low <= tp_price
-
-        if hit_sl and hit_tp:
-            exit_price = (bar_open if bar_open > sl_price else sl_price) * (1 + SLIPPAGE)
-            raw_ret = (entry_price - exit_price) / entry_price
-            return raw_ret - 2 * TAKER_COM
-
-        if hit_sl:
-            exit_price = (bar_open if bar_open > sl_price else sl_price) * (1 + SLIPPAGE)
-            raw_ret = (entry_price - exit_price) / entry_price
-            return raw_ret - 2 * TAKER_COM
-
-        if hit_tp:
-            exit_price = tp_price * (1 + SLIPPAGE)
-            raw_ret = (entry_price - exit_price) / entry_price
-            return raw_ret - 2 * TAKER_COM
-
-    exit_price = closes[-1] * (1 + SLIPPAGE)
-    raw_ret = (entry_price - exit_price) / entry_price
-    return raw_ret - 2 * TAKER_COM
-
-
 def add_trade_return_targets(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
 
@@ -302,22 +239,35 @@ def add_trade_return_targets(df: pd.DataFrame) -> pd.DataFrame:
         entry_bar_idx = i + 1
         horizon_end_idx = entry_bar_idx + HORIZON
 
-        entry_open = opens[entry_bar_idx]
-
-        long_entry_price = entry_open * (1 + SLIPPAGE)
-        short_entry_price = entry_open * (1 - SLIPPAGE)
-
         window_opens = opens[entry_bar_idx:horizon_end_idx]
         window_highs = highs[entry_bar_idx:horizon_end_idx]
         window_lows = lows[entry_bar_idx:horizon_end_idx]
         window_closes = closes[entry_bar_idx:horizon_end_idx]
 
-        long_targets[i] = _calc_long_trade_return_np(
-            long_entry_price, window_opens, window_highs, window_lows, window_closes
-        )
-        short_targets[i] = _calc_short_trade_return_np(
-            short_entry_price, window_opens, window_highs, window_lows, window_closes
-        )
+        long_targets[i] = simulate_trade_return(
+            direction=1,
+            entry_open=opens[entry_bar_idx],
+            opens=window_opens,
+            highs=window_highs,
+            lows=window_lows,
+            closes=window_closes,
+            tp_pct=TP_PCT,
+            sl_pct=SL_PCT,
+            slippage=SLIPPAGE,
+            taker_com=TAKER_COM,
+        ).return_pct
+        short_targets[i] = simulate_trade_return(
+            direction=-1,
+            entry_open=opens[entry_bar_idx],
+            opens=window_opens,
+            highs=window_highs,
+            lows=window_lows,
+            closes=window_closes,
+            tp_pct=TP_PCT,
+            sl_pct=SL_PCT,
+            slippage=SLIPPAGE,
+            taker_com=TAKER_COM,
+        ).return_pct
 
         if i % 5000 == 0 and i > 0:
             logger.info(f"   progress: {i}/{usable} ({i / usable * 100:.1f}%)")
