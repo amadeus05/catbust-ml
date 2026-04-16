@@ -57,7 +57,7 @@ def load_data_from_db():
 
 def get_purge_gap():
     bar_hours = TF_TO_HOURS.get(TIMEFRAME, 1)
-    return pd.Timedelta(hours=bar_hours * HORIZON)
+    return pd.Timedelta(hours=bar_hours * (HORIZON + 1))
 
 
 def bars_per_day_tf():
@@ -512,7 +512,7 @@ def train():
 
     print("\n⚙️ РЕЖИМ WALK-FORWARD (2x CatBoostRegressor, мультисимвольный)")
     print(f"Полный диапазон: {df_full['timestamp'].min()} -> {df_full['timestamp'].max()}")
-    print(f"Purge gap:       {purge_gap} (HORIZON={HORIZON})")
+    print(f"Purge gap:       {purge_gap} (HORIZON+1={HORIZON + 1})")
     print(f"Фичей:           {len(FEATURE_COLUMNS)}")
     print(f"Символов:        {df_full['symbol'].nunique()}")
     print(f"Фолдов:          {len(folds)}")
