@@ -1,11 +1,13 @@
-import requests
-import pandas as pd
-import pandas_ta as ta
-import numpy as np
-import sqlite3
 import logging
+import sqlite3
 import time
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+import requests
+
 from config import *
 
 logging.basicConfig(level=logging.INFO)
@@ -15,42 +17,29 @@ BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 
 def _hurst_rs_window(log_returns: np.ndarray) -> float:
-    """
-    Оценка Hurst по R/S на одном окне лог-доходностей (без lookahead).
-    Интерпретация: H > 0.5 — «память»/тренд, H < 0.5 — mean reversion, ~0.5 — близко к случайному блужданию.
-    """
     x = np.asarray(log_returns, dtype=np.float64)
     x = x[~np.isnan(x)]
     n = len(x)
+
     if n < max(32, HURST_WINDOW // 2):
         return np.nan
+
     mu = np.mean(x)
     y = np.cumsum(x - mu)
     r = np.max(y) - np.min(y)
     s = np.std(x, ddof=1)
+
     if s < 1e-12:
         return np.nan
+
     h = np.log((r / s) + 1e-12) / np.log(n)
     return float(np.clip(h, 0.0, 1.0))
 
-# Интервалы в миллисекундах
-TF_MS = {
-    "5m": 300_000,
-    "15m": 900_000,
-    "1h": 3_600_000,
-    "4h": 14_400_000,
-    "1d": 86_400_000,
-}
-
-# Эти параметры нужны, чтобы таргет считался максимально похоже на будущий бэктест
-TAKER_COM = 0.0004
-SLIPPAGE = 0.0003
-
 
 def init_db():
-    """Создание таблицы если не существует"""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS candles (
             symbol TEXT,
             timeframe TEXT,
@@ -63,20 +52,20 @@ def init_db():
             quote_volume REAL,
             PRIMARY KEY (symbol, timeframe, open_time)
         )
-    """)
+        """
+    )
     conn.commit()
     return conn
 
 
 def fetch_data(conn, symbol, timeframe):
-    """
-    Загрузка данных с Binance API начиная с START_DATE или последней точки в БД.
-    Поддерживает инкрементальную загрузку.
-    """
     api_symbol = symbol.replace("/", "")
 
     cur = conn.cursor()
-    cur.execute("SELECT MAX(open_time) FROM candles WHERE symbol=? AND timeframe=?", (symbol, timeframe))
+    cur.execute(
+        "SELECT MAX(open_time) FROM candles WHERE symbol=? AND timeframe=?",
+        (symbol, timeframe),
+    )
     last_ts = cur.fetchone()[0]
 
     if last_ts:
@@ -97,7 +86,7 @@ def fetch_data(conn, symbol, timeframe):
             "symbol": api_symbol,
             "interval": timeframe,
             "startTime": start_ts,
-            "limit": BINANCE_LIMIT
+            "limit": BINANCE_LIMIT,
         }
         if end_ts:
             params["endTime"] = end_ts
@@ -116,21 +105,33 @@ def fetch_data(conn, symbol, timeframe):
         rows = []
         for k in data:
             current_ts = k[0]
-            rows.append((
-                symbol, timeframe, current_ts,
-                float(k[1]), float(k[2]), float(k[3]), float(k[4]),
-                float(k[5]), float(k[7])
-            ))
+            rows.append(
+                (
+                    symbol,
+                    timeframe,
+                    current_ts,
+                    float(k[1]),
+                    float(k[2]),
+                    float(k[3]),
+                    float(k[4]),
+                    float(k[5]),
+                    float(k[7]),
+                )
+            )
             start_ts = current_ts + 1
 
         cur.executemany("INSERT OR IGNORE INTO candles VALUES (?,?,?,?,?,?,?,?,?)", rows)
         conn.commit()
         total_loaded += len(rows)
 
-        logger.info(f"[{symbol}-{timeframe}] Загружено {total_loaded} свечей, до {datetime.fromtimestamp((start_ts - 1) / 1000)}")
+        logger.info(
+            f"[{symbol}-{timeframe}] Загружено {total_loaded} свечей, "
+            f"до {datetime.fromtimestamp((start_ts - 1) / 1000)}"
+        )
 
         if len(data) < BINANCE_LIMIT:
             break
+
         if end_ts and start_ts >= end_ts:
             logger.info(f"[{symbol}-{timeframe}] Достигнута дата окончания {END_DATE}")
             break
@@ -141,7 +142,6 @@ def fetch_data(conn, symbol, timeframe):
 
 
 def load_from_db(conn, symbol, timeframe):
-    """Загрузка данных из БД в DataFrame"""
     df = pd.read_sql_query(
         """
         SELECT open_time as timestamp, open, high, low, close, volume
@@ -150,359 +150,69 @@ def load_from_db(conn, symbol, timeframe):
         ORDER BY open_time
         """,
         conn,
-        params=(symbol, timeframe)
+        params=(symbol, timeframe),
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
 
-def add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Добавляет признаки микроструктуры:
-    - CVD proxy (Cumulative Volume Delta аналог по барам)
-    - Wick ratios (тени свечей нормированные на диапазон)
-    - Close position within range
-    """
-    hl_range = df["high"] - df["low"]
-    hl_range = hl_range.where(hl_range != 0, 1e-9)
-
-    df["feat_clv"] = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / hl_range
-
-    df["feat_wick_upper"] = (df["high"] - np.maximum(df["open"], df["close"])) / hl_range
-    df["feat_wick_lower"] = (np.minimum(df["open"], df["close"]) - df["low"]) / hl_range
-
-    body = np.abs(df["close"] - df["open"])
-    df["feat_body_ratio"] = body / hl_range
-
-    prev_close = df["close"].shift(1)
-    prev_safe = prev_close.replace(0, np.nan)
-    df["feat_gap"] = (df["open"] - prev_close) / prev_safe
-
-    return df
-
-
-def add_volatility_regime_features(df: pd.DataFrame, windows: list = None) -> pd.DataFrame:
-    """
-    Добавляет признаки волатильности и режимов сжатия/расширения.
-    """
-    if windows is None:
-        windows = [5, 20, 60]
-
-    tr1 = df["high"] - df["low"]
-    tr2 = np.abs(df["high"] - df["close"].shift(1))
-    tr3 = np.abs(df["low"] - df["close"].shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    for w in windows:
-        atr = tr.rolling(window=w).mean()
-        df[f"feat_atr_{w}"] = atr
-        df[f"feat_vol_norm_{w}"] = atr / df["close"].replace(0, 1e-9)
-
-        if w > 5:
-            long_vol = tr.rolling(window=w * 3).mean()
-            df[f"feat_vol_squeeze_{w}"] = atr / (long_vol + 1e-9)
-
-        hl_ratio = (df["high"] / df["low"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-        ln_hl = np.log(hl_ratio)
-        parkinson = np.sqrt((1 / (4 * np.log(2))) * (ln_hl**2).rolling(window=w).mean())
-        df[f"feat_parkinson_{w}"] = parkinson
-
-    return df
-
-
-def add_volume_vwap_features(df: pd.DataFrame, windows: list = None) -> pd.DataFrame:
-    """
-    Добавляет признаки, связывающие объем и цену (VWAP, OBV logic).
-    """
-    if windows is None:
-        windows = [10, 50]
-
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
-
-    for w in windows:
-        cum_vol = df["volume"].rolling(window=w).sum()
-        cum_pv = (typical_price * df["volume"]).rolling(window=w).sum()
-        vwap = cum_pv / (cum_vol + 1e-9)
-        df[f"feat_vwap_{w}"] = vwap
-        df[f"feat_price_vwap_dist_{w}"] = (df["close"] - vwap) / vwap.replace(0, 1e-9)
-
-    for w in [10, 50]:
-        avg_vol = df["volume"].rolling(window=w).mean()
-        df[f"feat_vol_momentum_{w}"] = df["volume"] / (avg_vol + 1e-9)
-
-    raw_money_flow = typical_price * df["volume"]
-    positive_flow = raw_money_flow.where(df["close"] > df["close"].shift(1), 0)
-    negative_flow = raw_money_flow.where(df["close"] < df["close"].shift(1), 0)
-
-    for w in [14]:
-        pos_sum = positive_flow.rolling(window=w).sum()
-        neg_sum = negative_flow.rolling(window=w).sum()
-        df[f"feat_mf_ratio_{w}"] = pos_sum / (neg_sum + 1e-9)
-
-    return df
-
-
-def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Создает явные взаимодействия между ключевыми метриками.
-    """
-    if "feat_ret_1" in df.columns and "feat_vol_norm_20" in df.columns:
-        df["feat_trend_strength"] = df["feat_ret_1"] * df["feat_vol_norm_20"]
-
-    if "feat_body_ratio" in df.columns and "feat_vol_momentum_10" in df.columns:
-        df["feat_breakout_conf"] = df["feat_body_ratio"] * df["feat_vol_momentum_10"]
-
-    if "feat_price_vwap_dist_50" in df.columns and "feat_vol_momentum_10" in df.columns:
-        df["feat_mean_rev_signal"] = df["feat_price_vwap_dist_50"] * (
-            1.0 / (df["feat_vol_momentum_10"] + 0.1)
-        )
-
-    return df
-
-
-def add_momentum_quality_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Добавляет фичи, оценивающие КАЧЕСТВО тренда.
-    Решает проблему низкого Spearman, отделяя сильный импульс от шума.
-    """
-    df["feat_ret_accel"] = df["feat_ret_1"] - df["feat_ret_1"].shift(1)
-
-    hl_range = df["high"] - df["low"]
-    hl_range = hl_range.where(hl_range != 0, 1e-9)
-    df["feat_close_position"] = (df["close"] - df["low"]) / hl_range
-
-    window = 5
-    time_idx = np.arange(window, dtype=np.float64)
-
-    def rolling_r_squared(series: pd.Series) -> float:
-        if len(series) < window:
-            return np.nan
-        y = series.values[-window:].astype(np.float64)
-        y_mean = y.mean()
-        x_mean = time_idx.mean()
-        num = ((time_idx - x_mean) * (y - y_mean)).sum()
-        den = np.sqrt(((time_idx - x_mean) ** 2).sum() * ((y - y_mean) ** 2).sum())
-        if den == 0:
-            return 0.0
-        r = num / den
-        return float(r**2)
-
-    df["feat_trend_purity"] = df["close"].rolling(window=window).apply(
-        rolling_r_squared, raw=False
-    )
-
-    df["feat_intra_strength"] = np.sign(df["close"] - df["open"]) * (
-        np.abs(df["close"] - df["open"]) / hl_range
-    )
-
-    return df
-
-
-def add_volume_pressure_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Добавляет фичи давления объема.
-    Помогает отсеять ложные пробои (нет объема) и подтвердить истинные.
-    """
-    vol = df["volume"].fillna(0)
-    ret = df["feat_ret_1"]
-
-    df["feat_vol_pressure"] = vol * ret
-
-    avg_vol = vol.rolling(20).mean()
-    vol_spike = vol / (avg_vol + 1e-9)
-
-    hl_range = df["high"] - df["low"]
-    avg_range = hl_range.rolling(20).mean()
-    range_norm = hl_range / (avg_range + 1e-9)
-
-    df["feat_vol_efficiency"] = range_norm / (vol_spike + 1e-9)
-
-    window = 10
-    df["feat_cum_delta_vol"] = (vol * np.sign(ret)).rolling(window).sum()
-
-    return df
-
-
-def add_regime_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Кросс-фичи между существующими признаками (режимы, риск, пробой).
-    """
-    if "feat_ret_1" in df.columns and "atr_pct" in df.columns:
-        df["feat_risk_adj_return"] = df["feat_ret_1"] / (df["atr_pct"] + 1e-9)
-
-    if "Dist_to_Resistance" in df.columns and "feat_vol_momentum_10" in df.columns:
-        df["feat_breakout_potential"] = (
-            1.0 / (df["Dist_to_Resistance"].abs() + 1e-9)
-        ) * df["feat_vol_momentum_10"]
-
-    if "hurst_rs" in df.columns and "feat_ret_1" in df.columns:
-        hurst_signal = (df["hurst_rs"] - 0.5) * np.sign(df["feat_ret_1"])
-        df["feat_persistent_trend"] = hurst_signal * df["feat_ret_1"].abs()
-
-    return df
-
-
-def add_features(df):
-    """
-    Базовые фичи без подглядывания в будущее.
-    Отключённые «слабые» колонки не считаются — список: WEAK_FEATURES_DISABLED в config.py.
-    """
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df["ret_24"] = df["close"].pct_change(24)
+    close_safe = df["close"].replace(0, 1e-9)
+    ret_1 = df["close"].pct_change(1)
 
-    _ret1 = df["close"].pct_change(1)
-    df["feat_ret_1"] = _ret1
+    df["ret_24"] = df["close"].pct_change(24)
 
     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
 
+    df["vol_24"] = ret_1.rolling(24).std()
+    vol_12 = ret_1.rolling(12).std()
+    df["vol_ratio_12_24"] = vol_12 / df["vol_24"].replace(0, 1e-9)
+
     adx_df = df.ta.adx(
-        high=df["high"], low=df["low"], close=df["close"], length=ADX_LENGTH
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        length=ADX_LENGTH,
     )
     if adx_df is not None:
         adx_col = f"ADX_{ADX_LENGTH}"
         if adx_col not in adx_df.columns:
-            cand = [c for c in adx_df.columns if c.startswith("ADX_") and not c.startswith("ADXR")]
-            adx_col = cand[0] if cand else adx_df.columns[0]
+            candidates = [c for c in adx_df.columns if c.startswith("ADX_") and not c.startswith("ADXR")]
+            adx_col = candidates[0] if candidates else adx_df.columns[0]
         df[f"ADX_{ADX_LENGTH}"] = adx_df[adx_col]
     else:
         df[f"ADX_{ADX_LENGTH}"] = np.nan
 
     log_ret = np.log(df["close"] / df["close"].shift(1)).replace([np.inf, -np.inf], np.nan)
     df["hurst_rs"] = log_ret.rolling(HURST_WINDOW, min_periods=HURST_WINDOW).apply(
-        _hurst_rs_window, raw=True
+        _hurst_rs_window,
+        raw=True,
     )
 
     atr_14 = df.ta.atr(length=14).replace(0, 1e-9)
     atr_28 = df.ta.atr(length=28).replace(0, 1e-9)
-    close_safe = df["close"].replace(0, 1e-9)
-
     df["atr_pct"] = atr_14 / close_safe
-
-    # --- v2 (геометрия / вола; FEATURE_SET_VERSION в config.py) ---
     df["atr_expansion_14_28"] = atr_14 / atr_28
-    # Ниже три колонки в WEAK_FEATURES_DISABLED — считаем для БД/анализа, в train не входят
-    bb_mid_20 = df["close"].rolling(20).mean()
-    bb_std_20 = df["close"].rolling(20).std()
-    df["bb_zscore_20"] = (df["close"] - bb_mid_20) / bb_std_20.replace(0, 1e-9)
-
-    _vol12 = _ret1.rolling(12).std()
-    df["vol_24"] = _ret1.rolling(24).std()
-
-    df["vol_ratio_12_24"] = _vol12 / df["vol_24"].replace(0, 1e-9)
 
     roll_high_20 = df["high"].rolling(20).max().shift(1)
     roll_low_20 = df["low"].rolling(20).min().shift(1)
     roll_high_50 = df["high"].rolling(50).max().shift(1)
     roll_low_50 = df["low"].rolling(50).min().shift(1)
 
-    df["dist_to_low_50"] = (df["close"] - roll_low_50) / close_safe
-
-    cw20 = ((roll_high_20 - roll_low_20) / close_safe).replace(0, 1e-9)
-    df["channel_width_20_vs_mean"] = cw20 / cw20.rolling(50).mean().replace(0, 1e-9)
-
+    channel_width_20 = (roll_high_20 - roll_low_20) / close_safe
+    df["channel_width_20_vs_mean"] = (
+        channel_width_20 / channel_width_20.rolling(50).mean().replace(0, 1e-9)
+    )
     df["channel_width_50"] = (roll_high_50 - roll_low_50) / close_safe
 
-    vol_ma_20 = df["volume"].rolling(20).mean().replace(0, 1e-9)
-    df["rel_volume_20"] = df["volume"] / vol_ma_20
-
-    sr_lookback = 50
-
-    resistance = df["high"].rolling(sr_lookback, min_periods=1).max().shift(1)
-    support = df["low"].rolling(sr_lookback, min_periods=1).min().shift(1)
+    resistance = df["high"].rolling(50, min_periods=1).max().shift(1)
+    support = df["low"].rolling(50, min_periods=1).min().shift(1)
 
     df["Dist_to_Resistance"] = (resistance - df["close"]) / atr_14
     df["Dist_to_Support"] = (df["close"] - support) / atr_14
-
-    # Опционально: микроструктура / вола / VWAP / кросс-фичи — раскомментируйте и добавьте колонки в config.FEATURE_COLUMNS
-    # df = add_microstructure_features(df)
-    # df = add_volatility_regime_features(df, windows=[5, 20, 60])
-    # df = add_volume_vwap_features(df, windows=[10, 50])
-    # df = add_interaction_features(df)
-    df = add_momentum_quality_features(df)
-    df = add_volume_pressure_features(df)
-    df = add_regime_interaction_features(df)
-
-    df.dropna(inplace=True)
-    return df
-
-
-def build_mkt_corr_btc_eth(btc_df, eth_df):
-    """
-    v3: общий фон — rolling corr доходностей BTC и ETH (одинаков для всех символов на timestamp).
-    """
-    if btc_df is None or eth_df is None or len(btc_df) == 0 or len(eth_df) == 0:
-        return pd.DataFrame(columns=["timestamp", "mkt_corr_btc_eth_60"])
-    m = btc_df[["timestamp", "close"]].merge(
-        eth_df[["timestamp", "close"]], on="timestamp", how="inner", suffixes=("_btc", "_eth")
-    )
-    if len(m) == 0:
-        return pd.DataFrame(columns=["timestamp", "mkt_corr_btc_eth_60"])
-    rb = m["close_btc"].pct_change()
-    reth = m["close_eth"].pct_change()
-    m["mkt_corr_btc_eth_60"] = rb.rolling(MKT_CORR_BTC_ETH_WINDOW).corr(reth)
-    return m[["timestamp", "mkt_corr_btc_eth_60"]]
-
-
-def add_global_context_v3(df, btc_df, mkt_corr_btc_eth_df, symbol):
-    """
-    v3: beta и corr доходностей актива vs BTC (relative strength / системный риск);
-    плюс merge mkt_corr_btc_eth_60. Для самого BTC — beta/corr к себе = 1.
-    """
-    df = df.copy()
-    cols_beta = ["beta_btc_60", "corr_btc_60", "beta_btc_120", "corr_btc_120"]
-
-    if btc_df is None or len(btc_df) == 0:
-        for c in cols_beta:
-            df[c] = np.nan
-        if mkt_corr_btc_eth_df is not None and len(mkt_corr_btc_eth_df):
-            df = df.merge(mkt_corr_btc_eth_df, on="timestamp", how="left")
-        else:
-            df["mkt_corr_btc_eth_60"] = np.nan
-        return df
-
-    b = btc_df[["timestamp", "close"]].rename(columns={"close": "_btc_close"})
-    out = df.merge(b, on="timestamp", how="left")
-    r_a = out["close"].pct_change()
-    r_b = out["_btc_close"].pct_change()
-
-    if symbol == BTC_ANCHOR_SYMBOL:
-        for c in cols_beta:
-            out[c] = 1.0
-    else:
-        vs, vl = BETA_BTC_SHORT, BETA_BTC_LONG
-        v_b_s = r_b.rolling(vs).var().replace(0, 1e-12)
-        v_b_l = r_b.rolling(vl).var().replace(0, 1e-12)
-        out["beta_btc_60"] = r_a.rolling(vs).cov(r_b) / v_b_s
-        out["corr_btc_60"] = r_a.rolling(vs).corr(r_b)
-        out["beta_btc_120"] = r_a.rolling(vl).cov(r_b) / v_b_l
-        out["corr_btc_120"] = r_a.rolling(vl).corr(r_b)
-
-    out = out.drop(columns=["_btc_close"])
-
-    if mkt_corr_btc_eth_df is not None and len(mkt_corr_btc_eth_df):
-        out = out.merge(mkt_corr_btc_eth_df, on="timestamp", how="left")
-    else:
-        out["mkt_corr_btc_eth_60"] = np.nan
-
-    return out
-
-
-def add_htf_features(df, htf_df):
-    """
-    Только HTF_Trend.
-    shift(1) оставляем, чтобы использовать только завершённые HTF свечи.
-    Сейчас не вызывается из main(): HTF_Trend в WEAK_FEATURES_DISABLED (config.py).
-    """
-    htf = htf_df.copy()
-    htf_ema50 = htf["close"].ewm(span=50, adjust=False).mean().shift(1)
-    htf["HTF_Trend"] = (htf["close"].shift(1) > htf_ema50).astype(int)
-    htf = htf[["timestamp", "HTF_Trend"]].dropna()
-
-    df = df.sort_values("timestamp")
-    htf = htf.sort_values("timestamp")
-    df = pd.merge_asof(df, htf, on="timestamp", direction="backward")
 
     df.dropna(inplace=True)
     return df
@@ -572,7 +282,7 @@ def _calc_short_trade_return_np(entry_price, opens, highs, lows, closes):
     return raw_ret - 2 * TAKER_COM
 
 
-def add_trade_return_targets(df):
+def add_trade_return_targets(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
 
     n = len(df)
@@ -619,8 +329,7 @@ def add_trade_return_targets(df):
     return df
 
 
-def save_processed(df, symbol):
-    """Сохранение обработанных данных в отдельную таблицу"""
+def save_processed(df: pd.DataFrame, symbol: str):
     conn = sqlite3.connect(DB_PATH)
     table_name = symbol.replace("/", "_") + "_features"
     df.to_sql(table_name, conn, if_exists="replace", index=False)
@@ -631,43 +340,21 @@ def save_processed(df, symbol):
 def main():
     conn = init_db()
 
-    if ENABLE_GLOBAL_CONTEXT_ETL:
-        fetch_data(conn, BTC_ANCHOR_SYMBOL, TIMEFRAME)
-        fetch_data(conn, ETH_ANCHOR_SYMBOL, TIMEFRAME)
-        btc_ref = load_from_db(conn, BTC_ANCHOR_SYMBOL, TIMEFRAME)
-        eth_ref = load_from_db(conn, ETH_ANCHOR_SYMBOL, TIMEFRAME)
-        mkt_corr_btc_eth = build_mkt_corr_btc_eth(btc_ref, eth_ref)
-        if len(mkt_corr_btc_eth) == 0:
-            logger.warning("⚠️ v3: нет пересечения BTC/ETH по timestamp — mkt_corr_btc_eth_60 будет NaN")
-    else:
-        btc_ref = None
-        mkt_corr_btc_eth = pd.DataFrame()
-
     for symbol in SYMBOLS:
         logger.info(f"Loading {symbol} {TIMEFRAME} from {START_DATE}...")
         loaded = fetch_data(conn, symbol, TIMEFRAME)
         logger.info(f"{symbol} {TIMEFRAME}: {loaded} new candles")
 
-        logger.info(f"Loading {symbol} {HTF_TIMEFRAME} from {START_DATE}...")
-        htf_loaded = fetch_data(conn, symbol, HTF_TIMEFRAME)
-        logger.info(f"{symbol} {HTF_TIMEFRAME}: {htf_loaded} new candles")
-
         df = load_from_db(conn, symbol, TIMEFRAME)
-        htf_df = load_from_db(conn, symbol, HTF_TIMEFRAME)
+        if len(df) == 0:
+            logger.warning(f"{symbol}: no data in DB")
+            continue
 
-        if len(df) > 0 and len(htf_df) > 0:
-            logger.info(f"{symbol}: {TIMEFRAME}={len(df)}, {HTF_TIMEFRAME}={len(htf_df)} свечей")
+        logger.info(f"{symbol}: {TIMEFRAME}={len(df)} свечей")
 
-            df = add_features(df)
-            if ENABLE_GLOBAL_CONTEXT_ETL:
-                df = add_global_context_v3(df, btc_ref, mkt_corr_btc_eth, symbol)
-            # HTF_Trend в WEAK_FEATURES_DISABLED — merge HTF не делаем
-            df = add_trade_return_targets(df)
-
-            save_processed(df, symbol)
-            logger.info(f"{symbol}: saved {len(df)} rows (features + trade return targets)")
-        else:
-            logger.warning(f"{symbol}: no data in DB ({TIMEFRAME}={len(df)}, {HTF_TIMEFRAME}={len(htf_df)})")
+        df = add_features(df)
+        df = add_trade_return_targets(df)
+        save_processed(df, symbol)
 
     conn.close()
 
