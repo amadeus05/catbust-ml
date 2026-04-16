@@ -135,7 +135,7 @@ CALIBRATION_DEFAULT_LONG_THRESHOLD = float("inf")
 CALIBRATION_DEFAULT_SHORT_THRESHOLD = float("inf")
 
 # --- Regime filter в bt.py ---
-ENABLE_REGIME_FILTER = True
+ENABLE_REGIME_FILTER = False  # Отключено: анализ показал, что фильтры ухудшают результаты
 REGIME_MIN_HURST = 0.52
 REGIME_MIN_ADX = 18.0
 REGIME_MIN_CHANNEL_WIDTH_RATIO = 0.80
