@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 
+def _date_to_utc_ms(date_str: str) -> int:
+    ts = pd.Timestamp(date_str)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return int(ts.timestamp() * 1000)
+
+
 def _hurst_rs_window(log_returns: np.ndarray) -> float:
     x = np.asarray(log_returns, dtype=np.float64)
     x = x[~np.isnan(x)]
@@ -72,9 +81,9 @@ def fetch_data(conn, symbol, timeframe):
     if last_ts:
         start_ts = last_ts + 1
     else:
-        start_ts = int(datetime.fromisoformat(START_DATE).timestamp() * 1000)
+        start_ts = _date_to_utc_ms(START_DATE)
 
-    end_ts = int(datetime.fromisoformat(END_DATE).timestamp() * 1000) if END_DATE else None
+    end_ts = _date_to_utc_ms(END_DATE) if END_DATE else None
 
     if end_ts and start_ts >= end_ts:
         logger.info(f"[{symbol}-{timeframe}] Данные уже загружены до {END_DATE}")
@@ -143,15 +152,26 @@ def fetch_data(conn, symbol, timeframe):
 
 
 def load_from_db(conn, symbol, timeframe):
-    df = pd.read_sql_query(
-        """
+    start_ts = _date_to_utc_ms(START_DATE)
+    end_ts = _date_to_utc_ms(END_DATE) if END_DATE else None
+
+    query = """
         SELECT open_time as timestamp, open, high, low, close, volume
         FROM candles
-        WHERE symbol=? AND timeframe=?
-        ORDER BY open_time
-        """,
+        WHERE symbol=? AND timeframe=? AND open_time >= ?
+    """
+    params = [symbol, timeframe, start_ts]
+
+    if end_ts is not None:
+        query += " AND open_time <= ?"
+        params.append(end_ts)
+
+    query += " ORDER BY open_time"
+
+    df = pd.read_sql_query(
+        query,
         conn,
-        params=(symbol, timeframe),
+        params=params,
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df

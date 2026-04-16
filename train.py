@@ -41,6 +41,12 @@ def load_data_from_db():
         df = df.dropna(
             subset=["timestamp", *FEATURE_COLUMNS, "Target_Long_Return", "Target_Short_Return"]
         ).copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        start_ts = pd.to_datetime(START_DATE)
+        df = df[df["timestamp"] >= start_ts]
+        if END_DATE:
+            end_ts = pd.to_datetime(END_DATE)
+            df = df[df["timestamp"] <= end_ts]
 
         all_data.append(df)
 
@@ -50,7 +56,6 @@ def load_data_from_db():
         return pd.DataFrame()
 
     df_full = pd.concat(all_data, ignore_index=True)
-    df_full["timestamp"] = pd.to_datetime(df_full["timestamp"])
     df_full = df_full.sort_values("timestamp").reset_index(drop=True)
     return df_full
 

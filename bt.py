@@ -48,6 +48,9 @@ def load_all_data(symbols, feature_names):
             df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
             if "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df[df["timestamp"] >= pd.to_datetime(START_DATE)]
+                if END_DATE:
+                    df = df[df["timestamp"] <= pd.to_datetime(END_DATE)]
 
                 cols_to_keep = [
                     "timestamp", "open", "high", "low", "close",
