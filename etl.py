@@ -156,6 +156,192 @@ def load_from_db(conn, symbol, timeframe):
     return df
 
 
+def add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет признаки микроструктуры:
+    - CVD proxy (Cumulative Volume Delta аналог по барам)
+    - Wick ratios (тени свечей нормированные на диапазон)
+    - Close position within range
+    """
+    hl_range = df["high"] - df["low"]
+    hl_range = hl_range.where(hl_range != 0, 1e-9)
+
+    df["feat_clv"] = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / hl_range
+
+    df["feat_wick_upper"] = (df["high"] - np.maximum(df["open"], df["close"])) / hl_range
+    df["feat_wick_lower"] = (np.minimum(df["open"], df["close"]) - df["low"]) / hl_range
+
+    body = np.abs(df["close"] - df["open"])
+    df["feat_body_ratio"] = body / hl_range
+
+    prev_close = df["close"].shift(1)
+    prev_safe = prev_close.replace(0, np.nan)
+    df["feat_gap"] = (df["open"] - prev_close) / prev_safe
+
+    return df
+
+
+def add_volatility_regime_features(df: pd.DataFrame, windows: list = None) -> pd.DataFrame:
+    """
+    Добавляет признаки волатильности и режимов сжатия/расширения.
+    """
+    if windows is None:
+        windows = [5, 20, 60]
+
+    tr1 = df["high"] - df["low"]
+    tr2 = np.abs(df["high"] - df["close"].shift(1))
+    tr3 = np.abs(df["low"] - df["close"].shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    for w in windows:
+        atr = tr.rolling(window=w).mean()
+        df[f"feat_atr_{w}"] = atr
+        df[f"feat_vol_norm_{w}"] = atr / df["close"].replace(0, 1e-9)
+
+        if w > 5:
+            long_vol = tr.rolling(window=w * 3).mean()
+            df[f"feat_vol_squeeze_{w}"] = atr / (long_vol + 1e-9)
+
+        hl_ratio = (df["high"] / df["low"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        ln_hl = np.log(hl_ratio)
+        parkinson = np.sqrt((1 / (4 * np.log(2))) * (ln_hl**2).rolling(window=w).mean())
+        df[f"feat_parkinson_{w}"] = parkinson
+
+    return df
+
+
+def add_volume_vwap_features(df: pd.DataFrame, windows: list = None) -> pd.DataFrame:
+    """
+    Добавляет признаки, связывающие объем и цену (VWAP, OBV logic).
+    """
+    if windows is None:
+        windows = [10, 50]
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+
+    for w in windows:
+        cum_vol = df["volume"].rolling(window=w).sum()
+        cum_pv = (typical_price * df["volume"]).rolling(window=w).sum()
+        vwap = cum_pv / (cum_vol + 1e-9)
+        df[f"feat_vwap_{w}"] = vwap
+        df[f"feat_price_vwap_dist_{w}"] = (df["close"] - vwap) / vwap.replace(0, 1e-9)
+
+    for w in [10, 50]:
+        avg_vol = df["volume"].rolling(window=w).mean()
+        df[f"feat_vol_momentum_{w}"] = df["volume"] / (avg_vol + 1e-9)
+
+    raw_money_flow = typical_price * df["volume"]
+    positive_flow = raw_money_flow.where(df["close"] > df["close"].shift(1), 0)
+    negative_flow = raw_money_flow.where(df["close"] < df["close"].shift(1), 0)
+
+    for w in [14]:
+        pos_sum = positive_flow.rolling(window=w).sum()
+        neg_sum = negative_flow.rolling(window=w).sum()
+        df[f"feat_mf_ratio_{w}"] = pos_sum / (neg_sum + 1e-9)
+
+    return df
+
+
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Создает явные взаимодействия между ключевыми метриками.
+    """
+    if "feat_ret_1" in df.columns and "feat_vol_norm_20" in df.columns:
+        df["feat_trend_strength"] = df["feat_ret_1"] * df["feat_vol_norm_20"]
+
+    if "feat_body_ratio" in df.columns and "feat_vol_momentum_10" in df.columns:
+        df["feat_breakout_conf"] = df["feat_body_ratio"] * df["feat_vol_momentum_10"]
+
+    if "feat_price_vwap_dist_50" in df.columns and "feat_vol_momentum_10" in df.columns:
+        df["feat_mean_rev_signal"] = df["feat_price_vwap_dist_50"] * (
+            1.0 / (df["feat_vol_momentum_10"] + 0.1)
+        )
+
+    return df
+
+
+def add_momentum_quality_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет фичи, оценивающие КАЧЕСТВО тренда.
+    Решает проблему низкого Spearman, отделяя сильный импульс от шума.
+    """
+    df["feat_ret_accel"] = df["feat_ret_1"] - df["feat_ret_1"].shift(1)
+
+    hl_range = df["high"] - df["low"]
+    hl_range = hl_range.where(hl_range != 0, 1e-9)
+    df["feat_close_position"] = (df["close"] - df["low"]) / hl_range
+
+    window = 5
+    time_idx = np.arange(window, dtype=np.float64)
+
+    def rolling_r_squared(series: pd.Series) -> float:
+        if len(series) < window:
+            return np.nan
+        y = series.values[-window:].astype(np.float64)
+        y_mean = y.mean()
+        x_mean = time_idx.mean()
+        num = ((time_idx - x_mean) * (y - y_mean)).sum()
+        den = np.sqrt(((time_idx - x_mean) ** 2).sum() * ((y - y_mean) ** 2).sum())
+        if den == 0:
+            return 0.0
+        r = num / den
+        return float(r**2)
+
+    df["feat_trend_purity"] = df["close"].rolling(window=window).apply(
+        rolling_r_squared, raw=False
+    )
+
+    df["feat_intra_strength"] = np.sign(df["close"] - df["open"]) * (
+        np.abs(df["close"] - df["open"]) / hl_range
+    )
+
+    return df
+
+
+def add_volume_pressure_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет фичи давления объема.
+    Помогает отсеять ложные пробои (нет объема) и подтвердить истинные.
+    """
+    vol = df["volume"].fillna(0)
+    ret = df["feat_ret_1"]
+
+    df["feat_vol_pressure"] = vol * ret
+
+    avg_vol = vol.rolling(20).mean()
+    vol_spike = vol / (avg_vol + 1e-9)
+
+    hl_range = df["high"] - df["low"]
+    avg_range = hl_range.rolling(20).mean()
+    range_norm = hl_range / (avg_range + 1e-9)
+
+    df["feat_vol_efficiency"] = range_norm / (vol_spike + 1e-9)
+
+    window = 10
+    df["feat_cum_delta_vol"] = (vol * np.sign(ret)).rolling(window).sum()
+
+    return df
+
+
+def add_regime_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Кросс-фичи между существующими признаками (режимы, риск, пробой).
+    """
+    if "feat_ret_1" in df.columns and "atr_pct" in df.columns:
+        df["feat_risk_adj_return"] = df["feat_ret_1"] / (df["atr_pct"] + 1e-9)
+
+    if "Dist_to_Resistance" in df.columns and "feat_vol_momentum_10" in df.columns:
+        df["feat_breakout_potential"] = (
+            1.0 / (df["Dist_to_Resistance"].abs() + 1e-9)
+        ) * df["feat_vol_momentum_10"]
+
+    if "hurst_rs" in df.columns and "feat_ret_1" in df.columns:
+        hurst_signal = (df["hurst_rs"] - 0.5) * np.sign(df["feat_ret_1"])
+        df["feat_persistent_trend"] = hurst_signal * df["feat_ret_1"].abs()
+
+    return df
+
+
 def add_features(df):
     """
     Базовые фичи без подглядывания в будущее.
@@ -166,6 +352,7 @@ def add_features(df):
     df["ret_24"] = df["close"].pct_change(24)
 
     _ret1 = df["close"].pct_change(1)
+    df["feat_ret_1"] = _ret1
 
     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
@@ -227,6 +414,15 @@ def add_features(df):
 
     df["Dist_to_Resistance"] = (resistance - df["close"]) / atr_14
     df["Dist_to_Support"] = (df["close"] - support) / atr_14
+
+    # Опционально: микроструктура / вола / VWAP / кросс-фичи — раскомментируйте и добавьте колонки в config.FEATURE_COLUMNS
+    # df = add_microstructure_features(df)
+    # df = add_volatility_regime_features(df, windows=[5, 20, 60])
+    # df = add_volume_vwap_features(df, windows=[10, 50])
+    # df = add_interaction_features(df)
+    df = add_momentum_quality_features(df)
+    df = add_volume_pressure_features(df)
+    df = add_regime_interaction_features(df)
 
     df.dropna(inplace=True)
     return df

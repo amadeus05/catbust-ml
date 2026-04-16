@@ -40,6 +40,16 @@ def load_data_from_db():
             print(f"⚠️ Пропуск {table}: нет новых таргетов {needed_cols}")
             continue
 
+        missing_feat = [c for c in FEATURE_COLUMNS if c not in df.columns]
+        if missing_feat:
+            fv = globals().get("FEATURE_SET_VERSION", "?")
+            raise ValueError(
+                f"Таблица «{table}» устарела: нет {len(missing_feat)} колонок из config.FEATURE_COLUMNS "
+                f"(FEATURE_SET_VERSION={fv}).\n"
+                f"Примеры: {missing_feat[:12]}{'…' if len(missing_feat) > 12 else ''}\n"
+                "Пересоберите фичи: python etl.py"
+            )
+
         df = df.dropna(
             subset=["timestamp", *FEATURE_COLUMNS, "Target_Long_Return", "Target_Short_Return"]
         ).copy()

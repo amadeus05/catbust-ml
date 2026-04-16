@@ -83,6 +83,17 @@ FEATURE_COLUMNS_ACTIVE = (
     "atr_pct",
     "Dist_to_Support",
     "atr_expansion_14_28",
+    "feat_ret_1",
+    # Качество импульса, давление объёма, режимные взаимодействия (etl без блоков micro/vol/vwap/interaction)
+    "feat_ret_accel",
+    "feat_close_position",
+    "feat_trend_purity",
+    "feat_intra_strength",
+    "feat_vol_pressure",
+    "feat_vol_efficiency",
+    "feat_cum_delta_vol",
+    "feat_risk_adj_return",
+    "feat_persistent_trend",
 )
 
 FEATURE_COLUMNS_CORE = FEATURE_COLUMNS_ACTIVE
@@ -101,11 +112,11 @@ _FEATURE_PROFILE_MAP = {
     "core_plus_v3": FEATURE_COLUMNS_CORE_PLUS_V3,
 }
 FEATURE_COLUMNS = _FEATURE_PROFILE_MAP.get(FEATURE_PROFILE, FEATURE_COLUMNS_CORE_PLUS)
-FEATURE_SET_VERSION = 2
+FEATURE_SET_VERSION = 5
 
 # --- DATA LOADING ---
 START_DATE = "2023-01-01"
-END_DATE = None
+END_DATE = "2026-04-15"
 BINANCE_LIMIT = 1500
 BINANCE_SLEEP = 0.3
 

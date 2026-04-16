@@ -256,10 +256,10 @@ def train_models_walk_forward_slice(df_train: pd.DataFrame, verbose=False):
     y_short_tr = tr["Target_Short_Return"]
     y_short_va = va["Target_Short_Return"]
 
-    long_model, long_pred, _ = train_single_regressor(
+    long_model, long_pred, _, _ = train_single_regressor(
         X_tr, y_long_tr, X_va, y_long_va, verbose=verbose
     )
-    short_model, short_pred, _ = train_single_regressor(
+    short_model, short_pred, _, _ = train_single_regressor(
         X_tr, y_short_tr, X_va, y_short_va, verbose=verbose
     )
 
