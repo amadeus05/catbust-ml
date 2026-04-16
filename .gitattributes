@@ -1,0 +1,27 @@
+# Единые окончания строк в репозитории (LF) — меньше предупреждений Git про CRLF/LF
+* text=auto eol=lf
+
+# Скрипты Windows: в репозитории часто оставляют CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Бинарные файлы — без конвертации
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.7z binary
+*.pkl binary
+*.joblib binary
+*.h5 binary
+*.hdf5 binary
+*.pth binary
+*.pt binary
+*.onnx binary
+*.parquet binary
+*.feather binary
